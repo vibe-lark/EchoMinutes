@@ -1,0 +1,66 @@
+{
+  "manifest_version": 3,
+  "name": "Echo Minutes",
+  "version": "1.0",
+  "description": "读取小宇宙页面音频，并一键上传到飞书妙记",
+  "permissions": [
+    "storage",
+    "webRequest",
+    "cookies",
+    "scripting",
+    "declarativeNetRequest",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://www.xiaoyuzhoufm.com/*",
+    "https://*.xyzcdn.net/*",
+    "https://*.feishu.cn/*",
+    "https://*.larkoffice.com/*",
+    "https://internal-api-space.feishu.cn/*",
+    "https://internal-api-space.larkoffice.com/*",
+    "https://internal-api.feishu.cn/*",
+    "https://internal-api.larkoffice.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background/main.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.xiaoyuzhoufm.com/episode/*",
+        "https://www.xiaoyuzhoufm.com/podcast/*/episode/*"
+      ],
+      "js": [
+        "src/content/main.js"
+      ]
+    }
+  ],
+  "action": {
+    "default_icon": {
+      "16": "images/logo.png",
+      "48": "images/logo.png",
+      "128": "images/logo.png"
+    }
+  },
+  "icons": {
+    "16": "images/logo.png",
+    "48": "images/logo.png",
+    "128": "images/logo.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "images/logo.png",
+        "images/Crobat.png",
+        "images/Crobat.svg",
+        "images/icon16.png",
+        "images/icon48.png",
+        "images/icon128.png"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}
