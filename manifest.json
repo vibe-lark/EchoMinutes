@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Echo Minutes",
-  "version": "1.0",
-  "description": "读取小宇宙页面音频，并一键上传到飞书妙记",
+  "name": "小宇宙/Bilibili转存飞书妙记",
+  "version": "1.6",
+  "description": "读取小宇宙页面音频或Bilibili视频，并一键上传到飞书妙记",
   "permissions": [
     "storage",
     "webRequest",
@@ -12,30 +12,41 @@
     "activeTab"
   ],
   "host_permissions": [
-    "https://www.xiaoyuzhoufm.com/*",
-    "https://*.xyzcdn.net/*",
-    "https://*.feishu.cn/*",
-    "https://*.larkoffice.com/*",
-    "https://internal-api-space.feishu.cn/*",
-    "https://internal-api-space.larkoffice.com/*",
-    "https://internal-api.feishu.cn/*",
-    "https://internal-api.larkoffice.com/*"
+    "https://*/*",
+    "http://*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.xiaoyuzhoufm.com/*",
+        "https://xiaoyuzhoufm.com/*"
+      ],
+      "js": [
+        "src/content/analytics.js",
+        "src/content/main.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://www.bilibili.com/video/*",
+        "https://bilibili.com/video/*"
+      ],
+      "js": [
+        "browser-sdk/browser-muxer.js",
+        "browser-sdk/bilibili-sdk.js",
+        "src/content/analytics.js",
+        "src/content/bilibili.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
   ],
   "background": {
     "service_worker": "src/background/main.js",
     "type": "module"
   },
-  "content_scripts": [
-    {
-      "matches": [
-        "https://www.xiaoyuzhoufm.com/episode/*",
-        "https://www.xiaoyuzhoufm.com/podcast/*/episode/*"
-      ],
-      "js": [
-        "src/content/main.js"
-      ]
-    }
-  ],
   "action": {
     "default_icon": {
       "16": "images/logo.png",
@@ -56,7 +67,10 @@
         "images/Crobat.svg",
         "images/icon16.png",
         "images/icon48.png",
-        "images/icon128.png"
+        "images/icon128.png",
+        "vendor/byted-tea-sdk/index.min.js",
+        "browser-sdk/browser-muxer.js",
+        "browser-sdk/bilibili-sdk.js"
       ],
       "matches": [
         "<all_urls>"

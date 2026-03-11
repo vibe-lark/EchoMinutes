@@ -111,10 +111,13 @@ function injectCSS() {
 }
 
 export function createUploadButton(mediaUrl, titleText = '', albumText = '') {
-  console.log('[EchoBat Content Script] createUploadButton called with title:', `"${titleText}"`); // 添加调试日志
-  console.log('[EchoBat Content Script] createUploadButton called with album:', `"${albumText}"`); // 添加调试日志
-  console.log('[EchoBat Content Script] createUploadButton title type:', typeof titleText); // 添加调试日志
-  console.log('[EchoBat Content Script] createUploadButton title length:', titleText.length); // 添加调试日志
+  log('[Content] createUploadButton invoked', {
+    mediaUrl,
+    title: titleText,
+    album: albumText,
+    titleType: typeof titleText,
+    titleLength: titleText.length,
+  });
   
   const container = document.createElement('div');
   container.className = 'echo-bat-upload-container';
@@ -139,10 +142,6 @@ export function createUploadButton(mediaUrl, titleText = '', albumText = '') {
     const buttonText = container.querySelector('.echo-bat-button-text');
     buttonText.textContent = '📥 正在上传...';
     
-    console.log(`[EchoBat Content Script] Sending upload request for URL: ${mediaUrl} with title: "${titleText}" and album: "${albumText}"`);
-    console.log('[EchoBat Content Script] Title type:', typeof titleText); // 添加调试日志
-    console.log('[EchoBat Content Script] Title length:', titleText.length); // 添加调试日志
-
     // 发送URL和标题给background script，让background script处理文件下载和命名
     const message = { 
       action: 'uploadFile', 
@@ -150,10 +149,12 @@ export function createUploadButton(mediaUrl, titleText = '', albumText = '') {
       title: titleText,
       albumName: albumText // 添加专辑名称
     };
-    console.log('[EchoBat Content Script] Message to be sent:', JSON.stringify(message)); // 添加调试日志
-    console.log('[EchoBat Content Script] Message title field:', message.title); // 添加调试日志
-    console.log('[EchoBat Content Script] Message albumName field:', message.albumName); // 添加调试日志
-    console.log('[EchoBat Content Script] Message title type:', typeof message.title); // 添加调试日志
+    log('[Content] Prepared upload message', {
+      mediaUrl,
+      title: titleText,
+      album: albumText,
+      payload: message,
+    });
     
     chrome.runtime.sendMessage(message, (response) => {
       container.classList.remove('loading');
@@ -190,11 +191,11 @@ export function createUploadButton(mediaUrl, titleText = '', albumText = '') {
         // 将链接添加到按钮文本后面
         buttonText.parentNode.appendChild(viewLink);
         
-        console.log('[EchoBat Content Script] Upload successful:', response.data);
+        log('[Content] Upload successful', response.data);
       } else {
         container.classList.add('error');
         buttonText.textContent = '❌ 上传失败';
-        console.log('[EchoBat Content Script] Upload failed:', response ? response.message : 'No response from background script.');
+        log('[Content] Upload failed', response ? response.message : 'No response from background script.');
       }
       // Reset state after a few seconds
       setTimeout(() => {

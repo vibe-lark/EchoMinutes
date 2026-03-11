@@ -5,6 +5,16 @@ import { log } from './log.js';
 import { FEATURES_ENABLE_PATH } from './constants.js';
 import { addFeishuApiRules } from '../background/network.js';
 
+const REQUIRED_HOST_ORIGINS = [
+  'https://feishu.cn/*',
+  'https://*.feishu.cn/*',
+  'https://larkoffice.com/*',
+  'https://*.larkoffice.com/*',
+];
+
+const FEISHU_DOMAIN_SUFFIXES = ['feishu.cn', 'larkoffice.com'];
+const BASE_FEISHU_DOMAINS = new Set(FEISHU_DOMAIN_SUFFIXES.map((suffix) => suffix.toLowerCase()));
+
 export const feishuCredentials = {
   csrfToken: null,
   cookie: null,
@@ -84,6 +94,15 @@ async function loadCredentialsFromStorage() {
           feishuCredentials.lastUpdated = lastUpdated;
           feishuCredentials.tenantDomain = tenantDomain;
 
+          if (isBaseFeishuDomain(feishuCredentials.tenantDomain)) {
+            const resolvedTenant = await resolveTenantDomainFromFeaturesApi();
+            if (resolvedTenant) {
+              feishuCredentials.tenantDomain = resolvedTenant;
+              feishuCredentials.lastUpdated = Date.now();
+              await saveCredentialsToStorage();
+            }
+          }
+
           log("Loaded and validated credentials from local storage.", {
             hasCsrf: !!csrfToken,
             hasCookie: !!cookie,
@@ -141,10 +160,34 @@ async function saveCredentialsToStorage() {
 }
 
 // 从 URL 中提取租户域名
+function normalizeDomain(domain) {
+  if (!domain) {
+    return '';
+  }
+  return domain.startsWith('.') ? domain.slice(1) : domain;
+}
+
+function isFeishuDomain(domain) {
+  if (!domain) {
+    return false;
+  }
+  const normalized = normalizeDomain(domain).toLowerCase();
+  return FEISHU_DOMAIN_SUFFIXES.some((suffix) => normalized === suffix || normalized.endsWith(`.${suffix}`));
+}
+
+function isBaseFeishuDomain(domain) {
+  if (!domain) {
+    return true;
+  }
+  const normalized = normalizeDomain(domain).toLowerCase();
+  return BASE_FEISHU_DOMAINS.has(normalized);
+}
+
 function extractTenantDomain(url) {
   try {
     const urlObj = new URL(url);
-    return urlObj.hostname; // 返回完整的域名，如 bytedance.larkoffice.com
+    const hostname = urlObj.hostname;
+    return hostname || null; // 返回完整的域名，如 bytedance.larkoffice.com
   } catch (error) {
     log("Error extracting tenant domain from URL:", url, error);
     return null;
@@ -188,60 +231,331 @@ async function closeFeishuTab(tabId) {
   }
 }
 
+async function ensureFeishuHostPermissions() {
+  if (!chrome?.permissions || !Array.isArray(REQUIRED_HOST_ORIGINS) || !REQUIRED_HOST_ORIGINS.length) {
+    return true;
+  }
+
+  try {
+    const alreadyGranted = await chrome.permissions.contains({
+      origins: REQUIRED_HOST_ORIGINS,
+    });
+    if (!alreadyGranted) {
+      log('Feishu host permissions missing even though they are declared in manifest.');
+    }
+  } catch (error) {
+    log('Failed to check Feishu host permissions:', error);
+  }
+
+  return true;
+}
+
+function waitForTabFinalUrl(tabId, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    if (typeof tabId !== 'number') {
+      resolve(null);
+      return;
+    }
+
+    let resolved = false;
+
+    function cleanup(result) {
+      if (resolved) {
+        return;
+      }
+      resolved = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      resolve(result || null);
+    }
+
+    const listener = (updatedTabId, changeInfo, tab) => {
+      if (updatedTabId !== tabId) {
+        return;
+      }
+      const updatedUrl = changeInfo?.url || tab?.url || null;
+      if (changeInfo?.status === 'complete' || updatedUrl) {
+        cleanup(updatedUrl || tab?.url || null);
+      }
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+
+    const timer = setTimeout(async () => {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        cleanup(tab?.url || null);
+      } catch {
+        cleanup(null);
+      }
+    }, timeoutMs);
+  });
+}
+
+async function detectTenantDomainFromTab(tabId) {
+  try {
+    const finalUrl = await waitForTabFinalUrl(tabId);
+    if (!finalUrl) {
+      return null;
+    }
+    const hostname = extractTenantDomain(finalUrl);
+    if (hostname && isFeishuDomain(hostname)) {
+      log("Detected tenant domain from redirected tab:", hostname);
+      return hostname;
+    }
+  } catch (error) {
+    log("Failed to detect tenant domain from tab:", error);
+  }
+  return null;
+}
+
+async function collectAllFeishuCookies(additionalDomains = []) {
+  const collected = [];
+  const seen = new Set();
+  const domainsToQuery = new Set([
+    ...additionalDomains.filter(Boolean),
+    'feishu.cn',
+    '.feishu.cn',
+    'larkoffice.com',
+    '.larkoffice.com',
+  ]);
+
+  for (const domain of domainsToQuery) {
+    try {
+      const cookies = await chrome.cookies.getAll({ domain });
+      cookies.forEach((cookie) => {
+        const key = `${cookie.domain}:${cookie.name}:${cookie.path}`;
+        if (!seen.has(key) && isFeishuDomain(cookie.domain)) {
+          seen.add(key);
+          collected.push(cookie);
+        }
+      });
+    } catch (error) {
+      log("Error collecting cookies for domain:", domain, error);
+    }
+  }
+
+  // 作为兜底，再尝试拉取全部 cookies 并过滤 Feishu/Lark
+  if (!collected.length) {
+    try {
+      const allCookies = await chrome.cookies.getAll({});
+      allCookies.forEach((cookie) => {
+        if (!isFeishuDomain(cookie.domain)) {
+          return;
+        }
+        const key = `${cookie.domain}:${cookie.name}:${cookie.path}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          collected.push(cookie);
+        }
+      });
+    } catch (error) {
+      log("Error collecting fallback cookies:", error);
+    }
+  }
+
+  return collected;
+}
+
+function extractTenantDomainFromFeaturesPayload(text) {
+  if (!text) {
+    return null;
+  }
+
+  try {
+    const data = JSON.parse(text);
+    const candidate =
+      data?.tenant_domain ||
+      data?.tenantDomain ||
+      data?.data?.tenant_domain ||
+      data?.data?.tenantDomain ||
+      data?.data?.tenant?.tenant_domain ||
+      data?.data?.tenant?.tenantDomain ||
+      data?.data?.tenant?.domain ||
+      data?.tenant?.tenant_domain ||
+      data?.tenant?.domain;
+    if (candidate && isFeishuDomain(candidate) && !isBaseFeishuDomain(candidate)) {
+      return normalizeDomain(candidate);
+    }
+  } catch (error) {
+    // ignore JSON parse failures, fallback to regex
+  }
+
+  const regex = /([a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:feishu\.cn|larkoffice\.com))/i;
+  const match = text.match(regex);
+  if (match && match[1]) {
+    const candidate = normalizeDomain(match[1]);
+    if (isFeishuDomain(candidate) && !isBaseFeishuDomain(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+async function resolveTenantDomainFromFeaturesApi() {
+  if (!feishuCredentials.cookie) {
+    return null;
+  }
+
+  const domainsToTry = [
+    feishuCredentials.tenantDomain,
+    'feishu.cn',
+    'larkoffice.com',
+  ].filter(Boolean);
+
+  const tried = new Set();
+  for (const domain of domainsToTry) {
+    const normalized = normalizeDomain(domain);
+    if (!normalized || tried.has(normalized)) {
+      continue;
+    }
+    tried.add(normalized);
+
+    const url = `https://${normalized}${FEATURES_ENABLE_PATH}`;
+    try {
+      const headers = {
+        'accept': 'application/json, text/plain, */*',
+        'cache-control': 'no-cache',
+        'pragma': 'no-cache',
+        'referer': `https://${normalized}/minutes/home`,
+        'origin': `https://${normalized}`,
+      };
+      if (feishuCredentials.csrfToken) {
+        headers['bv-csrf-token'] = feishuCredentials.csrfToken;
+      }
+
+      const response = await fetch(url, {
+        method: 'GET',
+        headers,
+        credentials: 'include',
+        mode: 'cors',
+        cache: 'no-cache',
+      });
+
+      if (!response.ok) {
+        const bodySnippet = await response.text().catch(() => '');
+        log("resolveTenantDomainFromFeaturesApi received non-OK response.", {
+          domain: normalized,
+          status: response.status,
+          bodySnippet: bodySnippet ? bodySnippet.slice(0, 300) : '',
+        });
+        continue;
+      }
+
+      const text = await response.text();
+      const resolved = extractTenantDomainFromFeaturesPayload(text);
+      if (resolved) {
+        log("Resolved tenant domain via get_features_enable response.", {
+          resolvedTenant: resolved,
+          sourceDomain: normalized,
+        });
+        return resolved;
+      }
+    } catch (error) {
+      log("Failed to resolve tenant domain via get_features_enable call.", {
+        domain: normalized,
+        error: error?.message || String(error),
+      });
+    }
+  }
+
+  return null;
+}
+
+function deriveTenantDomainFromCookies(cookies) {
+  if (!Array.isArray(cookies) || !cookies.length) {
+    return null;
+  }
+  const sorted = cookies
+    .map((cookie) => normalizeDomain(cookie.domain))
+    .filter((domain) => isFeishuDomain(domain))
+    .sort((a, b) => b.length - a.length);
+
+  if (!sorted.length) {
+    return null;
+  }
+
+  // 排除根域名，优先使用带子域的租户域
+  const candidate = sorted.find((domain) => {
+    return FEISHU_DOMAIN_SUFFIXES.every((suffix) => domain !== suffix);
+  });
+
+  return candidate || sorted[0];
+}
+
+function deriveCsrfFromCookies(cookies) {
+  if (!Array.isArray(cookies)) {
+    return null;
+  }
+  const csrfCookie = cookies.find((cookie) => /^bv_csrf/i.test(cookie.name) || /^csrf_token/i.test(cookie.name));
+  return csrfCookie ? csrfCookie.value : null;
+}
+
 // Listen for network requests to capture the CSRF token and tenant domain
 chrome.webRequest.onBeforeSendHeaders.addListener(
-    async (details) => {
-        // 只监听飞书相关域名的 get_features_enable 请求
-        if (details.url.includes('/minutes/api/get_features_enable') &&
-            (details.url.includes('.feishu.cn') || details.url.includes('.larkoffice.com'))) {
-            log("Found matching request to get_features_enable, looking for CSRF token and tenant domain.");
-            log("Request URL:", details.url);
-            
-            // 提取租户域名
-            const tenantDomain = extractTenantDomain(details.url);
-            if (tenantDomain) {
-                // 检查是否是用户期望的租户域名（bytedance.larkoffice.com）
-                if (tenantDomain === 'bytedance.larkoffice.com' || feishuCredentials.tenantDomain !== tenantDomain) {
-                    feishuCredentials.tenantDomain = tenantDomain;
-                    feishuCredentials.lastUpdated = Date.now();
-                    log("Successfully captured/updated tenant domain.", {
-                        tenantDomain: tenantDomain,
-                        lastUpdated: new Date(feishuCredentials.lastUpdated).toISOString()
-                    });
-                    
-                    // 保存更新后的凭证
-                    await saveCredentialsToStorage();
-                    
-                    // 动态添加飞书API请求规则
-                    await addFeishuApiRules(tenantDomain);
-                }
-            }
-            
-            // 查找 CSRF token
-            const csrfHeader = details.requestHeaders.find(h => h.name.toLowerCase() === 'bv-csrf-token');
+  async (details) => {
+    try {
+      const url = new URL(details.url);
+      const hostname = url.hostname || '';
+      const isFeishuHost = hostname === 'feishu.cn' || hostname.endsWith('.feishu.cn');
+      const isLarkHost = hostname === 'larkoffice.com' || hostname.endsWith('.larkoffice.com');
+      const matchesTargetApi = url.pathname.includes('/minutes/api/get_features_enable');
 
-            if (csrfHeader && csrfHeader.value) {
-                if (feishuCredentials.csrfToken !== csrfHeader.value) {
-                    feishuCredentials.csrfToken = csrfHeader.value;
-                    feishuCredentials.lastUpdated = Date.now();
-                    log("Successfully captured/updated bv-csrf-token.", {
-                        hasCsrf: !!feishuCredentials.csrfToken,
-                        lastUpdated: new Date(feishuCredentials.lastUpdated).toISOString()
-                    });
-                    
-                    // 保存更新后的凭证
-                    await saveCredentialsToStorage();
-                }
-            } else {
-                log("bv-csrf-token header not found in request to get_features_enable.");
-                log("Available headers:", details.requestHeaders.map(h => h.name));
-            }
+      if (!matchesTargetApi || (!isFeishuHost && !isLarkHost)) {
+        return;
+      }
+
+      log("Found matching request to get_features_enable, looking for CSRF token and tenant domain.");
+      log("Request URL:", details.url);
+
+      // 提取租户域名
+      const tenantDomain = extractTenantDomain(details.url);
+      if (tenantDomain) {
+        if (feishuCredentials.tenantDomain !== tenantDomain) {
+          feishuCredentials.tenantDomain = tenantDomain;
+          feishuCredentials.lastUpdated = Date.now();
+          log("Successfully captured/updated tenant domain.", {
+            tenantDomain,
+            lastUpdated: new Date(feishuCredentials.lastUpdated).toISOString(),
+          });
+
+          await saveCredentialsToStorage();
+          await addFeishuApiRules(tenantDomain);
         }
-    },
-  { urls: [
-    "https://*.feishu.cn/*",
-    "https://*.larkoffice.com/*"
-  ]},
+      }
+
+      const csrfHeader = details.requestHeaders.find(
+        (h) => h.name && h.name.toLowerCase() === 'bv-csrf-token',
+      );
+
+      if (csrfHeader?.value) {
+        if (feishuCredentials.csrfToken !== csrfHeader.value) {
+          feishuCredentials.csrfToken = csrfHeader.value;
+          feishuCredentials.lastUpdated = Date.now();
+          log("Successfully captured/updated bv-csrf-token.", {
+            hasCsrf: !!feishuCredentials.csrfToken,
+            lastUpdated: new Date(feishuCredentials.lastUpdated).toISOString(),
+          });
+
+          await saveCredentialsToStorage();
+        }
+      } else {
+        log("bv-csrf-token header not found in request to get_features_enable.");
+        log("Available headers:", details.requestHeaders.map((h) => h.name));
+      }
+    } catch (error) {
+      log("Error processing webRequest event:", error);
+    }
+  },
+  {
+    urls: [
+      "https://feishu.cn/*",
+      "https://*.feishu.cn/*",
+      "https://larkoffice.com/*",
+      "https://*.larkoffice.com/*",
+    ],
+  },
   ["requestHeaders"]
 );
 
@@ -298,6 +612,13 @@ export async function getFeishuCredentials() {
         hasCsrf: !!feishuCredentials.csrfToken,
         tenantDomain: feishuCredentials.tenantDomain
     });
+
+    try {
+      await ensureFeishuHostPermissions();
+    } catch (error) {
+      log('Unable to proceed without Feishu host permissions:', error);
+      return Promise.reject(error?.message || '需要授予访问飞书域名的权限才能继续上传。');
+    }
 
     // 首先尝试从本地存储加载凭证
     const loadedFromStorage = await loadCredentialsFromStorage();
@@ -373,28 +694,33 @@ export async function getFeishuCredentials() {
                 index: 999  // 将标签页放在最后，减少被用户注意到的可能性
             });
             feishuTabId = tab.id;
-            
-            // 等待页面加载和CSRF令牌捕获
-            let attempts = 0;
-            const maxAttempts = 15; // 增加尝试次数，因为需要等待页面加载
-            
-            while (attempts < maxAttempts) {
-                // 检查是否已经获取到CSRF令牌
-                if (feishuCredentials.csrfToken) {
-                    log("CSRF Token successfully captured after opening Feishu Minutes page.");
-                    break;
-                }
-                
-                // 等待2秒，给页面更多加载时间
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                attempts++;
-                
-                log(`Waiting for CSRF Token... Attempt ${attempts}/${maxAttempts}`);
+
+            const redirectedTenant = await detectTenantDomainFromTab(feishuTabId);
+            if (redirectedTenant && feishuCredentials.tenantDomain !== redirectedTenant) {
+                feishuCredentials.tenantDomain = redirectedTenant;
+                feishuCredentials.lastUpdated = Date.now();
+                log("Tenant domain detected from redirected tab:", redirectedTenant);
+                await saveCredentialsToStorage();
+                await addFeishuApiRules(redirectedTenant);
             }
             
-            // 如果仍然没有获取到CSRF令牌，提示用户登录
-            if (!feishuCredentials.csrfToken) {
-                log("Failed to capture CSRF Token after opening Feishu Minutes page.");
+            // 耐心等待 cookies/CSRF，过程中也尝试直接从 cookies 里推断
+            let attempts = 0;
+            const maxAttempts = 15;
+            while (attempts < maxAttempts) {
+                const harvested = await attemptCookieHarvest();
+                if (harvested && feishuCredentials.csrfToken && feishuCredentials.cookie) {
+                    log("Credentials captured while waiting for Feishu Minutes page to load.");
+                    break;
+                }
+
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                attempts++;
+                log(`Waiting for CSRF Token... Attempt ${attempts}/${maxAttempts}`);
+            }
+
+            if (!feishuCredentials.csrfToken || !feishuCredentials.cookie) {
+                log("Failed to capture credentials after opening Feishu Minutes page.");
                 return Promise.reject("无法获取飞书妙记的登录信息，请确保您已登录飞书妙记。如果已登录，请刷新页面后重试。");
             }
         } catch (e) {
@@ -403,76 +729,111 @@ export async function getFeishuCredentials() {
         }
     }
 
-    // 使用更安全的 chrome.cookies API 获取 Cookie
-    try {
-        // 使用租户域名获取必要的 cookies（仅获取认证相关的Cookie）
-        const domain = feishuCredentials.tenantDomain || "feishu.cn";
-        const cookies = await chrome.cookies.getAll({domain: domain});
+    async function attemptCookieHarvest() {
+        try {
+            const candidateDomains = [];
+            if (feishuCredentials.tenantDomain) {
+                candidateDomains.push(feishuCredentials.tenantDomain);
+            }
+            const cookies = await collectAllFeishuCookies(candidateDomains);
 
-        // 过滤只获取飞书特定的必要认证相关Cookie
-        const feishuEssentialCookiePatterns = [
-            /^session/i,
-            /^sessionid/i,
-            /^csrftoken/i,
-            /^_csrf/i,
-            /^bv_session/i,
-            /^bv_csrf/i,
-            /^uid/i,
-            /^sid/i,
-            /^ssoid/i,
-            /^passport/i,
-            /^auth/i,
-            /^login/i,
-            /^feishu/i,
-            /^lark/i,
-            // 飞书特定的Cookie名称
-            /^t_/i,
-            /^lk_/i
-        ];
+            const feishuEssentialCookiePatterns = [
+                /^session/i,
+                /^sessionid/i,
+                /^csrftoken/i,
+                /^_csrf/i,
+                /^bv_session/i,
+                /^bv_csrf/i,
+                /^uid/i,
+                /^sid/i,
+                /^ssoid/i,
+                /^passport/i,
+                /^auth/i,
+                /^login/i,
+                /^feishu/i,
+                /^lark/i,
+                /^t_/i,
+                /^lk_/i
+            ];
 
-        const filteredCookies = cookies.filter(cookie => {
-            // 使用正则表达式进行更精确的匹配
-            return feishuEssentialCookiePatterns.some(pattern =>
-                pattern.test(cookie.name)
-            ) &&
-            // 排除明显的跟踪和广告Cookie
-            !cookie.name.toLowerCase().includes('_ga') &&
-            !cookie.name.toLowerCase().includes('_gid') &&
-            !cookie.name.toLowerCase().includes('_fbp') &&
-            !cookie.name.toLowerCase().includes('_utm') &&
-            !cookie.name.toLowerCase().includes('analytics');
-        });
+            const filteredCookies = cookies.filter(cookie => {
+                return feishuEssentialCookiePatterns.some(pattern => pattern.test(cookie.name)) &&
+                    !cookie.name.toLowerCase().includes('_ga') &&
+                    !cookie.name.toLowerCase().includes('_gid') &&
+                    !cookie.name.toLowerCase().includes('_fbp') &&
+                    !cookie.name.toLowerCase().includes('_utm') &&
+                    !cookie.name.toLowerCase().includes('analytics');
+            });
 
-        if (filteredCookies.length > 0) {
-            const cookieString = filteredCookies.map(c => `${c.name}=${c.value}`).join('; ');
+            if (filteredCookies.length > 0) {
+                const cookieString = filteredCookies.map(c => `${c.name}=${c.value}`).join('; ');
+                const detectedTenant = deriveTenantDomainFromCookies(filteredCookies);
+                const csrfFromCookie = deriveCsrfFromCookies(filteredCookies);
+
+            if (!feishuCredentials.tenantDomain && detectedTenant) {
+                feishuCredentials.tenantDomain = detectedTenant;
+                log("Derived tenant domain from cookies:", detectedTenant);
+                await addFeishuApiRules(detectedTenant);
+            }
+
+            const uniqueCookieDomains = Array.from(new Set(filteredCookies.map(c => `${c.domain || ''}${c.hostOnly ? ' (hostOnly)' : ''}`)));
+
             log("Successfully retrieved essential cookies using chrome.cookies API. Details:", {
                 totalCount: cookies.length,
                 filteredCount: filteredCookies.length,
                 filteredCookieNames: filteredCookies.map(c => c.name),
-                domain: domain
+                tenantDomain: feishuCredentials.tenantDomain,
+                cookieDomains: uniqueCookieDomains,
             });
 
-            feishuCredentials.cookie = cookieString;
-            feishuCredentials.lastUpdated = Date.now();
-
-            // 保存凭证到本地存储
-            await saveCredentialsToStorage();
-
-            // 关闭飞书妙记页面（如果 feishuTabId 存在）
-            if (feishuTabId) {
-                await closeFeishuTab(feishuTabId);
+            if (isBaseFeishuDomain(feishuCredentials.tenantDomain)) {
+                const resolvedTenant = await resolveTenantDomainFromFeaturesApi();
+                if (resolvedTenant) {
+                    feishuCredentials.tenantDomain = resolvedTenant;
+                    log("Tenant domain resolved via features API:", resolvedTenant);
+                    await addFeishuApiRules(resolvedTenant);
+                }
             }
 
-            return {
-                cookie: cookieString,
-                csrfToken: feishuCredentials.csrfToken,
-                uploadToken: feishuCredentials.uploadToken,
-                tenantDomain: feishuCredentials.tenantDomain
-            };
-        } else {
-            log("No cookies found for domain:", domain);
-            throw new Error(`No Feishu cookies found for domain: ${domain}. Please ensure you are logged in.`);
+            if (!feishuCredentials.csrfToken && csrfFromCookie) {
+                feishuCredentials.csrfToken = csrfFromCookie;
+                log("Derived CSRF token from cookies.");
+            }
+
+            if (!feishuCredentials.cookie) {
+                feishuCredentials.cookie = cookieString;
+            }
+
+            feishuCredentials.lastUpdated = Date.now();
+            await saveCredentialsToStorage();
+
+            return true;
+            }
+        } catch (error) {
+            log("Cookie harvest attempt failed:", error);
         }
+
+        return false;
+    }
+
+    // 使用更安全的 chrome.cookies API 获取 Cookie
+    try {
+        const harvested = await attemptCookieHarvest();
+        if (!harvested || !feishuCredentials.cookie) {
+            throw new Error("No Feishu cookies captured. Please ensure you are logged in.");
+        }
+
+        // 关闭飞书妙记页面（如果 feishuTabId 存在）
+        if (feishuTabId) {
+            await closeFeishuTab(feishuTabId);
+        }
+
+        return {
+            cookie: feishuCredentials.cookie,
+            csrfToken: feishuCredentials.csrfToken,
+            uploadToken: feishuCredentials.uploadToken,
+            tenantDomain: feishuCredentials.tenantDomain
+        };
     } catch (error) {
         log("Cookie retrieval failed:", error);
 

@@ -13,3 +13,6 @@ export const BOX_UPLOAD_FINISH_PATH = "/space/api/box/upload/finish/";
 
 // 上传相关常量
 export const BLOCK_SIZE = 4 * 1024 * 1024; // 4MB per block, as required by Feishu API
+
+// Telemetry configuration
+export const TELEMETRY_ENDPOINT = null; // Configure with your collector endpoint if remote reporting is required
